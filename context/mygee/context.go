@@ -17,7 +17,13 @@ type Context struct {
 	Req        *http.Request
 	Path       string
 	Method     string
+	Params     map[string]string
 	StatusCode int
+
+	handlers []HandlerFunc
+	index    int
+
+	e *Engine
 }
 
 func NewContext(w http.ResponseWriter, req *http.Request) *Context {
@@ -26,6 +32,14 @@ func NewContext(w http.ResponseWriter, req *http.Request) *Context {
 		Req:    req,
 		Path:   req.URL.Path,
 		Method: req.Method,
+		index:  -1,
+	}
+}
+
+func (c *Context) Next() {
+	c.index++
+	for ; c.index < len(c.handlers); c.index++ {
+		c.handlers[c.index](c)
 	}
 }
 
@@ -37,6 +51,13 @@ func (c *Context) Status(code int) {
 func (c *Context) SetHeader(key string, val string) {
 	c.W.Header().Set(key, val)
 }
+
+func (c *Context) Param(key string) string {
+	if _, ok := c.Params[key]; ok {
+		return c.Params[key]
+	}
+	return ""
+}
 func (c *Context) PostForm(key string) string {
 	return c.Req.FormValue(key)
 }
@@ -46,9 +67,9 @@ func (c *Context) Query(key string) string {
 }
 
 func (c *Context) String(code int, format string, value ...interface{}) {
-	c.SetHeader("Content-type", "text/plain")
+	c.SetHeader("Content-Type", "text/plain")
 	c.Status(code)
-	c.W.Write([]byte(fmt.Sprintf(format, value)))
+	c.W.Write([]byte(fmt.Sprintf(format, value...)))
 }
 
 func (c *Context) Data(code int, data []byte) {
@@ -57,7 +78,7 @@ func (c *Context) Data(code int, data []byte) {
 }
 
 func (c *Context) JSON(code int, obj interface{}) {
-	c.SetHeader("Content-type", "application/json")
+	c.SetHeader("Content-Type", "application/json")
 	c.Status(code)
 	encode := json.NewEncoder(c.W)
 
@@ -67,8 +88,10 @@ func (c *Context) JSON(code int, obj interface{}) {
 
 }
 
-func (c *Context) HTML(code int, html string) {
-	c.SetHeader("Content-type", "text/html")
+func (c *Context) HTML(code int, name string, data interface{}) {
+	c.SetHeader("Content-Type", "text/html")
 	c.Status(code)
-	c.W.Write([]byte(html))
+	if err := c.e.htmlTemplates.ExecuteTemplate(c.W, name, data); err != nil {
+		http.Error(c.W, err.Error(), 500)
+	}
 }
