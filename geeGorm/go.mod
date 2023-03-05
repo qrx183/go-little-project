@@ -1,4 +1,4 @@
-module little_go_project
+module geeGorm
 
 go 1.18
 
