@@ -54,6 +54,8 @@ func (h *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 	defer h.mu.Unlock()
 	if h.peers != nil {
 		// 如果远程节点就是节点本身，没必要获取远程节点，在本身节点上就可以拿到缓存
+		// 这里的peer != h.self不仅是排除获取远程节点,还保证了每个key都是在经过一致性哈希选择对应的节点以后再在该节点上进行缓存更新
+		// 这样就保证了相同的key每次经过一致性哈希以后都会从同一个远程节点那里进行获取  妙!太妙了!
 		if peer := h.peers.Get(key); peer != "" && peer != h.self {
 			h.Log("Pick peer %s", peer)
 			return h.httpGetters[peer], true
@@ -66,6 +68,8 @@ func (h *HTTPPool) Log(format string, value ...interface{}) {
 	log.Printf("[Server %s] %s", h.self, fmt.Sprintf(format, value))
 }
 
+// ServeHTTP
+// http服务端
 func (h *HTTPPool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if !strings.HasPrefix(req.URL.Path, h.basePath) {
 		panic("HTTPPool serving unexpected path " + req.URL.Path)
@@ -99,6 +103,8 @@ func (h *HTTPPool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	w.Write(body)
 }
 
+// httpGetter
+// http客户端
 type httpGetter struct {
 	baseURL string
 }

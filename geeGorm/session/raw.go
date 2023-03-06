@@ -19,8 +19,19 @@ type Session struct {
 	dialect dialect.Dialect // 数据库类型  获取对应数据库的数据类型(辅助将go对象转换为对应数据库的表结构)   判断表是否存在
 	schema  *schema.Schema  // 转换go对象为表结构的对象
 
-	clause clause.Clause
+	clause clause.Clause // sql语句拆分
+
+	tx *sql.Tx // 事务
 }
+
+type CommonDB interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+var _ CommonDB = (*sql.DB)(nil)
+var _ CommonDB = (*sql.Tx)(nil)
 
 func NewSession(db *sql.DB, dialect dialect.Dialect) *Session {
 	return &Session{
@@ -29,7 +40,10 @@ func NewSession(db *sql.DB, dialect dialect.Dialect) *Session {
 	}
 }
 
-func (s *Session) DB() *sql.DB {
+func (s *Session) DB() CommonDB {
+	if s.tx != nil {
+		return s.tx
+	}
 	return s.db
 }
 func (s *Session) Clear() {
