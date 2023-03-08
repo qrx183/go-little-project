@@ -2,13 +2,16 @@ package geeRpc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"geeRpc/codec"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
@@ -16,13 +19,21 @@ const MagicNumber = 0x3bef5c
 // Option 在报头规定报文内容如何编解码
 // 规定客户端通过JSON编码Option部分,服务端通过JSON解码得到CodecType,然后由CodecType再去决定如何解码Body和Header
 type Option struct {
-	MagicNumber int // 用来唯一标识是rpc请求
-	CodecType   codec.Type
+	MagicNumber    int // 用来唯一标识是rpc请求
+	CodecType      codec.Type
+	ConnectTimeOut time.Duration
+	HandleTimeOut  time.Duration
 }
 
-var DefaultOption = &Option{MagicNumber: MagicNumber, CodecType: codec.GobType}
+var DefaultOption = &Option{
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeOut: time.Second * 10,
+}
 
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
 
 func NewServer() *Server {
 	return &Server{}
@@ -30,7 +41,41 @@ func NewServer() *Server {
 
 var DefaultServer = NewServer()
 
-func (s *Server) Accept(lis net.Listener) {
+func (s *Server) Register(rcvr interface{}) error {
+	serv := newService(rcvr)
+
+	if _, dup := s.serviceMap.LoadOrStore(serv.name, serv); dup {
+		return errors.New("rpc: service already defined: " + serv.name)
+	}
+	return nil
+}
+
+func (s *Server) FindService(serviceMethod string) (svc *service, mType *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill formed: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+
+	svci, ok := s.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc serve: can't find this service: " + serviceName)
+		return
+	}
+	svc = svci.(*service)
+
+	mType = svc.method[methodName]
+	if mType == nil {
+		err = errors.New("rpc server: can't find this method: " + methodName)
+	}
+	return
+}
+
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
+
+func (s *Server) Accept(lis net.Listener, timeout time.Duration) {
 
 	for {
 		conn, err := lis.Accept()
@@ -39,16 +84,16 @@ func (s *Server) Accept(lis net.Listener) {
 			continue
 		}
 		// 这里会并发执行请求的处理逻辑,所以不会影响accept的结束
-		s.ServeConn(conn)
+		s.ServeConn(conn, timeout)
 		fmt.Println("sss")
 	}
 }
 
 // Accept provide to user
-func Accept(lis net.Listener) {
-	DefaultServer.Accept(lis)
+func Accept(lis net.Listener, timeout time.Duration) {
+	DefaultServer.Accept(lis, timeout)
 }
-func (s *Server) ServeConn(conn net.Conn) {
+func (s *Server) ServeConn(conn net.Conn, timeout time.Duration) {
 	defer func() { _ = conn.Close() }()
 	var option Option
 	fmt.Println("aaaa")
@@ -71,29 +116,29 @@ func (s *Server) ServeConn(conn net.Conn) {
 		return
 	}
 
-	s.ServeCodec(f(conn))
+	s.ServeCodec(f(conn), timeout)
 }
 
 var invalidRequest = struct{}{}
 
-func (s *Server) ServeCodec(cc codec.Codec) {
+func (s *Server) ServeCodec(cc codec.Codec, timeout time.Duration) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 
 	for {
 		// 首先获取client请求
-		req, err := s.ReadRequest(cc)
+		req, err := s.readRequest(cc)
 		if err != nil {
 			if req == nil {
 				break // 请求为空,不需要去发送响应
 			}
 			req.h.Error = err.Error()
-			s.SendResponse(cc, req.h, invalidRequest, sending)
+			s.sendResponse(cc, req.h, invalidRequest, sending)
 			continue
 		}
 		wg.Add(1)
 		// 多个请求可以并发处理,但是需要逐一发送
-		go s.HandleRequest(cc, req, wg, sending)
+		go s.handleRequest(cc, req, wg, sending, timeout)
 	}
 	// 需要等待所有请求结束才能退出
 	wg.Wait()
@@ -103,9 +148,11 @@ func (s *Server) ServeCodec(cc codec.Codec) {
 type Request struct {
 	h            *codec.Header
 	argv, replyv reflect.Value
+	mType        *methodType
+	scv          *service
 }
 
-func (s *Server) ReadRequestHeader(cc codec.Codec) (*codec.Header, error) {
+func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	var header codec.Header
 
 	if err := cc.ReadHeader(&header); err != nil {
@@ -117,24 +164,34 @@ func (s *Server) ReadRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	return &header, nil
 }
 
-func (s *Server) ReadRequest(cc codec.Codec) (*Request, error) {
-	h, err := s.ReadRequestHeader(cc)
+func (s *Server) readRequest(cc codec.Codec) (*Request, error) {
+	h, err := s.readRequestHeader(cc)
 	if err != nil {
 		return nil, err
 	}
 	req := &Request{h: h}
 
 	// TODO 此时还无法得知arg的类型,因此暂时按string处理
-	req.argv = reflect.New(reflect.TypeOf(""))
+	req.scv, req.mType, err = s.FindService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.argv = req.mType.newArgV()
+	req.replyv = req.mType.newReplyV()
+
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
 	// 这里的req.argv一定要传Interface(),不然gob解码会报错
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
+	if err = cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read body error: ", err)
 		return nil, err
 	}
 	return req, nil
 }
 
-func (s *Server) SendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
+func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
 	// server send message
@@ -143,11 +200,45 @@ func (s *Server) SendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	}
 }
 
-func (s *Server) HandleRequest(cc codec.Codec, req *Request, wg *sync.WaitGroup, sending *sync.Mutex) {
-	// TODO 暂时先按照输出请求参数来处理请求
+func (s *Server) handleRequest(cc codec.Codec, req *Request, wg *sync.WaitGroup, sending *sync.Mutex, timeout time.Duration) {
+
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+
+	// 这里利用通道去判断请求处理是否超时,这里的通道应该设置为有缓冲通道
+	// 因为无缓冲通道在接受者从通道中取出信息执行的时候发送者才能将消息放入同道中人,如果接收者不执行接收操作,通道会一直堵塞,导致子协程无法正常退出,从而造成内存泄漏
+	called := make(chan struct{}, 1)
+	sent := make(chan struct{}, 1)
+
+	go func() {
+		err := req.scv.call(req.mType, req.argv, req.replyv)
+		// 在请求处理结束后填充通道
+		// 设置成无缓冲通道,发生超时以后这里会阻塞
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+	}()
+
 	// 这里的req.replyv一定要传.Interface(),不然gob解码会报错
-	s.SendResponse(cc, req.h, req.replyv.Interface(), sending)
+	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	sent <- struct{}{}
+
+	if timeout == 0 {
+		<-called
+		<-sent
+		return
+	}
+	// select类似switch语句,是专门针对通道设计的,每个case的条件都必须是一个通道操作
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+
+	case <-called:
+		// 如果请求没有被处理,这里会处于阻塞状态
+		<-sent
+	}
 }
