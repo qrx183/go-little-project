@@ -18,7 +18,7 @@ func startServer(addr chan string) {
 	}
 	log.Println("start rpc server on", l.Addr())
 	addr <- l.Addr().String()
-	geerpc.Accept(l, 5*time.Second)
+	geerpc.Accept(l)
 }
 
 func main() {

@@ -1,14 +1,19 @@
 package geeRpc
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"geeRpc/codec"
+	"geeRpc/xclient"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"reflect"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,6 +42,118 @@ type Client struct {
 	pending  map[uint64]*Call
 	closing  bool // user has closed
 	shutdown bool // server has told us stop
+}
+
+type XClient struct {
+	d       xclient.Discovery
+	mode    xclient.SelectMode
+	mu      sync.Mutex
+	opt     *Option
+	clients map[string]*Client
+}
+
+func NewXClient(d xclient.Discovery, mode xclient.SelectMode, opt *Option) *XClient {
+	return &XClient{
+		d:       d,
+		mode:    mode,
+		opt:     opt,
+		clients: make(map[string]*Client),
+	}
+}
+
+func (x *XClient) Close() error {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+
+	for k, v := range x.clients {
+		_ = v.Close()
+		delete(x.clients, k)
+	}
+	return nil
+}
+
+func (x *XClient) dial(rpcAddr string) (*Client, error) {
+	client, ok := x.clients[rpcAddr]
+
+	if ok && !client.IsAvailable() {
+		// handle the client is not useful
+		_ = client.Close()
+		delete(x.clients, rpcAddr)
+		client = nil
+	}
+
+	if client == nil {
+		client, err := XDial(rpcAddr, x.opt)
+		if err != nil {
+			return nil, err
+		}
+		x.clients[rpcAddr] = client
+	}
+	return client, nil
+}
+
+func (x *XClient) call(rpcAddr string, ctx context.Context, argS, replyV interface{}, serviceMethod string) error {
+	client, err := x.dial(rpcAddr)
+	if err != nil {
+		return err
+	}
+
+	return client.Call(ctx, serviceMethod, argS, replyV)
+}
+
+func (x *XClient) Call(ctx context.Context, args, replyV interface{}, serviceMethod string) error {
+	rpcAddr, err := x.d.Get(x.mode)
+
+	if err != nil {
+		return err
+	}
+	return x.call(rpcAddr, ctx, args, replyV, serviceMethod)
+}
+
+// BroadCast
+// 向所有服务实例进行广播,有一个错误即返回错误,有一个成功返回即返回该结果
+func (x *XClient) BroadCast(ctx context.Context, serviceMethod string, argS, reply interface{}) error {
+	servers, err := x.d.GetAll()
+	if err != nil {
+		return err
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	replyDone := reply == nil
+	var e error
+	ctx, cancel := context.WithCancel(ctx)
+	for _, rpcAddr := range servers {
+		wg.Add(1)
+		go func(rpcAddr string) {
+			defer wg.Done()
+			var clonedReply interface{}
+
+			if reply != nil {
+				clonedReply = reflect.New(reflect.ValueOf(reply).Type().Elem()).Interface()
+			}
+
+			err := x.call(rpcAddr, ctx, argS, clonedReply, serviceMethod)
+			// 如果不加锁并发情况下 reply和err可能被不正常赋值
+			// 通过加锁保证err和reply被正确赋值
+			mu.Lock()
+			if err != nil && e == nil {
+				e = err
+				// 如果发生错误直接终止协程   快速失败
+				cancel()
+			}
+
+			if err == nil && !replyDone {
+				// 使用反射进行赋值可以保证reply指针的指向不发生改变,从而让clonedReply可以被正常回收
+				// reply = clonedReply
+				reflect.ValueOf(reply).Set(reflect.ValueOf(clonedReply).Elem())
+				replyDone = true
+			}
+			mu.Unlock()
+		}(rpcAddr)
+	}
+	wg.Wait()
+	return e
 }
 
 var ErrorShutDown = errors.New("connection is shut down")
@@ -151,6 +268,38 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 		return nil, err
 	}
 	return newClientCodec(f(conn), opt), nil
+}
+
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultPCPath))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+func DialHTTP(network, addr string, opts ...*Option) (*Client, error) {
+	return dialTimeOut(NewHTTPClient, network, addr, opts...)
+}
+
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "HTTP":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		return Dial(protocol, addr, opts...)
+	}
 }
 
 func newClientCodec(cc codec.Codec, opt *Option) *Client {

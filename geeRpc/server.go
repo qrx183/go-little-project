@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -31,6 +32,12 @@ var DefaultOption = &Option{
 	ConnectTimeOut: time.Second * 10,
 }
 
+const (
+	connected        = "200 connected to Gee RPC"
+	defaultPCPath    = "/_geeprc_"
+	defaultDebugPath = "/debug/geerpc"
+)
+
 type Server struct {
 	serviceMap sync.Map
 }
@@ -40,6 +47,30 @@ func NewServer() *Server {
 }
 
 var DefaultServer = NewServer()
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECTED" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Println("rpc hijacking ", req.RemoteAddr, ": ", err)
+		return
+	}
+	_, _ = io.WriteString(conn, "http/1,0 "+connected+"\n\n")
+	s.ServeConn(conn)
+}
+
+func (s *Server) HandleHTTP() {
+	http.Handle(defaultPCPath, s)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}
 
 func (s *Server) Register(rcvr interface{}) error {
 	serv := newService(rcvr)
@@ -75,7 +106,7 @@ func (s *Server) FindService(serviceMethod string) (svc *service, mType *methodT
 
 func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
 
-func (s *Server) Accept(lis net.Listener, timeout time.Duration) {
+func (s *Server) Accept(lis net.Listener) {
 
 	for {
 		conn, err := lis.Accept()
@@ -84,16 +115,16 @@ func (s *Server) Accept(lis net.Listener, timeout time.Duration) {
 			continue
 		}
 		// 这里会并发执行请求的处理逻辑,所以不会影响accept的结束
-		s.ServeConn(conn, timeout)
+		s.ServeConn(conn)
 		fmt.Println("sss")
 	}
 }
 
 // Accept provide to user
-func Accept(lis net.Listener, timeout time.Duration) {
-	DefaultServer.Accept(lis, timeout)
+func Accept(lis net.Listener) {
+	DefaultServer.Accept(lis)
 }
-func (s *Server) ServeConn(conn net.Conn, timeout time.Duration) {
+func (s *Server) ServeConn(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	var option Option
 	fmt.Println("aaaa")
@@ -116,7 +147,7 @@ func (s *Server) ServeConn(conn net.Conn, timeout time.Duration) {
 		return
 	}
 
-	s.ServeCodec(f(conn), timeout)
+	s.ServeCodec(f(conn), option.ConnectTimeOut)
 }
 
 var invalidRequest = struct{}{}
